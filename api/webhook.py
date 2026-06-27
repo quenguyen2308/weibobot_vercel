@@ -431,16 +431,16 @@ async def process_update(update_data: dict):
                 "🖼 Weibo Image Bot\n\n"
                 "Paste link bài post Weibo → bot hiện preview album\n"
                 "→ Bấm Download All hoặc chọn từng ảnh\n\n"
-                "/all <url> — Download All Files"
+                "/a <url> — Download All Files"
             )
         )
         return
 
-    # /all <url>
-    if update.message and update.message.text and update.message.text.startswith("/all"):
+    # /a <url>
+    if update.message and update.message.text and update.message.text.startswith("/a"):
         parts = update.message.text.split(maxsplit=1)
         if len(parts) < 2:
-            await bot.send_message(chat_id=update.effective_chat.id, text="❌ Dùng: /all <weibo_url>")
+            await bot.send_message(chat_id=update.effective_chat.id, text="❌ Dùng: /a <weibo_url>")
             return
         url = parts[1].strip()
         post_id = extract_weibo_id(url)
