@@ -69,21 +69,36 @@ def extract_weibo_id(url: str) -> str | None:
     return None
 
 async def get_best_url(pid: str) -> tuple[str, int]:
-    """Thử GET theo thứ tự ưu tiên, lấy size đầu tiên thành công.
-    Dùng cho preview — chỉ cần URL + size, không cache content."""
+    """Tìm URL có content-length LỚN NHẤT trong các size khả dụng (dùng HEAD,
+    không tải nội dung). Logic phải đồng nhất với get_best_url_with_content
+    (dùng cho /all) — nếu không, size hiển thị trên nút sẽ sai vì sẽ trả về
+    ngay khi gặp variant đầu tiên (orj1080 — bản resize nhỏ) thay vì so sánh
+    để tìm bản gốc 'large' (size thật, thường lớn hơn nhiều)."""
     sizes = ["orj1080", "mw2000", "orj480", "large", "orj360"]
+    best_url, best_size = "", 0
+
     async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as client:
         for s in sizes:
-            for sub in ["wx2", "wx1", "wx3", "wx4"]:
-                url = f"https://{sub}.sinaimg.cn/{s}/{pid}.jpg"
-                try:
-                    resp = await client.get(url, timeout=15)
-                    if resp.status_code == 200:
-                        size = int(resp.headers.get("content-length", len(resp.content)))
-                        return url, size
-                except:
-                    pass
-    return "", 0
+            url = f"https://wx2.sinaimg.cn/{s}/{pid}.jpg"
+            try:
+                resp = await client.head(url, timeout=8)
+                if resp.status_code == 200:
+                    size = int(resp.headers.get("content-length", 0))
+                    if size > best_size:
+                        best_size, best_url = size, url
+                elif resp.status_code == 403:
+                    for sub in ["wx1", "wx3", "wx4"]:
+                        alt = f"https://{sub}.sinaimg.cn/{s}/{pid}.jpg"
+                        resp2 = await client.head(alt, timeout=8)
+                        if resp2.status_code == 200:
+                            size = int(resp2.headers.get("content-length", 0))
+                            if size > best_size:
+                                best_size, best_url = size, alt
+                            break
+            except:
+                pass
+
+    return best_url, best_size
 
 async def get_best_url_with_content(pid: str) -> tuple[str, int, bytes | None]:
     """Dùng cho /all — HEAD để tìm URL lớn nhất, rồi GET 1 lần duy nhất."""
