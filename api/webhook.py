@@ -342,38 +342,39 @@ async def show_preview(bot: Bot, chat_id: int, reply_to_message_id: int, url: st
     )
 
 async def download_and_send_all(bot: Bot, chat_id: int, raw_urls: list, raw_sizes: list, raw_contents: list | None = None, concurrency: int = 3):
-    """Upload ảnh với tối đa `concurrency` request đồng thời, thay vì tuần tự
-    từng ảnh kèm sleep 0.8s. Với album nhiều ảnh nặng (>10MB/ảnh), kiểu tuần
-    tự cũ rất dễ khiến tổng thời gian vượt maxDuration của Vercel → bị kill
-    giữa chừng mà không báo lỗi. Song song hoá giúp giảm mạnh wall-clock time."""
+    """Đảm bảo có nội dung từng ảnh song song (dùng cache nếu có, download nếu
+    chưa), nhưng GỬI lên Telegram tuần tự theo đúng thứ tự #1, #2, #3...
+    Lý do tách riêng: nếu để send_as_file chạy song song (như bản trước), ảnh
+    nhẹ upload xong trước, ảnh nặng xong sau — thứ tự hiện trong chat bị lộn,
+    dù nội dung đã tải/cache xong cùng lúc. Gửi tuần tự ở đây gần như không
+    tốn thêm thời gian vì content thường đã sẵn sàng trước khi đến lượt."""
     semaphore = asyncio.Semaphore(concurrency)
+    content_ready: list[bytes | None] = list(raw_contents) if raw_contents else [None] * len(raw_urls)
+
+    async def _ensure_one(i: int, img_url: str):
+        if content_ready[i] is None:
+            async with semaphore:
+                content_ready[i] = await download_image(img_url)
+
+    # Đảm bảo nội dung cho tất cả ảnh ngay (chạy nền song song nếu cần download thêm)
+    ensure_tasks = [asyncio.create_task(_ensure_one(i, url)) for i, url in enumerate(raw_urls)]
+
     success_count = 0
-    counter_lock = asyncio.Lock()
-
-    async def _send_one(i: int, img_url: str, size: int):
-        nonlocal success_count
-        async with semaphore:
-            # Dùng content cache nếu có (từ get_raw_images_for_download)
-            b = raw_contents[i] if raw_contents else None
-            if b is None:
-                b = await download_image(img_url)
-            if b:
-                try:
-                    await send_as_file(
-                        bot, chat_id, b,
-                        filename=get_filename_from_url(img_url),
-                        caption=f"#{i+1} — {format_size(size)}"
-                    )
-                    async with counter_lock:
-                        success_count += 1
-                except Exception as e:
-                    await bot.send_message(chat_id=chat_id, text=f"⚠️ Không upload được ảnh #{i+1}: {e}")
-            else:
-                await bot.send_message(chat_id=chat_id, text=f"⚠️ Không tải được ảnh #{i+1}: {img_url}")
-
-    await asyncio.gather(*[
-        _send_one(i, url, size) for i, (url, size) in enumerate(zip(raw_urls, raw_sizes))
-    ])
+    for i, (img_url, size) in enumerate(zip(raw_urls, raw_sizes)):
+        await ensure_tasks[i]  # thường đã xong sẵn, ít khi phải chờ thêm
+        b = content_ready[i]
+        if b:
+            try:
+                await send_as_file(
+                    bot, chat_id, b,
+                    filename=get_filename_from_url(img_url),
+                    caption=f"#{i+1} — {format_size(size)}"
+                )
+                success_count += 1
+            except Exception as e:
+                await bot.send_message(chat_id=chat_id, text=f"⚠️ Không upload được ảnh #{i+1}: {e}")
+        else:
+            await bot.send_message(chat_id=chat_id, text=f"⚠️ Không tải được ảnh #{i+1}: {img_url}")
 
     await bot.send_message(chat_id=chat_id, text=f"✅ Hoàn tất: {success_count}/{len(raw_urls)} ảnh")
 
