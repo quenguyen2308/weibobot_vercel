@@ -69,10 +69,29 @@ def extract_weibo_id(url: str) -> str | None:
     return None
 
 async def get_best_url(pid: str) -> tuple[str, int]:
+    """Thử GET theo thứ tự ưu tiên, lấy size đầu tiên thành công.
+    Dùng cho preview — chỉ cần URL + size, không cache content."""
     sizes = ["orj1080", "mw2000", "orj480", "large", "orj360"]
-    best_url = ""
-    best_size = 0
     async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as client:
+        for s in sizes:
+            for sub in ["wx2", "wx1", "wx3", "wx4"]:
+                url = f"https://{sub}.sinaimg.cn/{s}/{pid}.jpg"
+                try:
+                    resp = await client.get(url, timeout=15)
+                    if resp.status_code == 200:
+                        size = int(resp.headers.get("content-length", len(resp.content)))
+                        return url, size
+                except:
+                    pass
+    return "", 0
+
+async def get_best_url_with_content(pid: str) -> tuple[str, int, bytes | None]:
+    """Dùng cho /all — HEAD để tìm URL lớn nhất, rồi GET 1 lần duy nhất."""
+    sizes = ["orj1080", "mw2000", "orj480", "large", "orj360"]
+    best_url, best_size = "", 0
+
+    async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as client:
+        # Bước 1: HEAD để tìm URL lớn nhất
         for s in sizes:
             url = f"https://wx2.sinaimg.cn/{s}/{pid}.jpg"
             try:
@@ -80,11 +99,32 @@ async def get_best_url(pid: str) -> tuple[str, int]:
                 if resp.status_code == 200:
                     size = int(resp.headers.get("content-length", 0))
                     if size > best_size:
-                        best_size = size
-                        best_url = url
+                        best_size, best_url = size, url
+                elif resp.status_code == 403:
+                    for sub in ["wx1", "wx3", "wx4"]:
+                        alt = f"https://{sub}.sinaimg.cn/{s}/{pid}.jpg"
+                        resp2 = await client.head(alt, timeout=8)
+                        if resp2.status_code == 200:
+                            size = int(resp2.headers.get("content-length", 0))
+                            if size > best_size:
+                                best_size, best_url = size, alt
+                            break
             except:
                 pass
-    return best_url, best_size
+
+        if not best_url:
+            return "", 0, None
+
+        # Bước 2: GET 1 lần duy nhất URL tốt nhất
+        try:
+            resp = await client.get(best_url, timeout=60)
+            if resp.status_code == 200:
+                data = resp.content
+                return best_url, len(data), data
+        except Exception as e:
+            print(f"[get_best_url_with_content] GET failed: {best_url} — {e}")
+
+    return "", 0, None
 
 async def download_image(url: str, timeout: int = 30, retries: int = 3) -> bytes | None:
     for attempt in range(retries):
@@ -110,6 +150,7 @@ async def download_image(url: str, timeout: int = 30, retries: int = 3) -> bytes
     return None
 
 async def get_raw_images(post_id: str) -> tuple[list[str], list[str], list[int]]:
+    """Dùng cho preview — chỉ cần URL + size."""
     thumb_urls = []
     raw_urls = []
     api_url = f"https://m.weibo.cn/statuses/show?id={post_id}"
@@ -148,6 +189,45 @@ async def get_raw_images(post_id: str) -> tuple[list[str], list[str], list[int]]
             return [], [], []
 
     return thumb_urls, raw_urls, raw_sizes
+
+async def get_raw_images_for_download(post_id: str) -> tuple[list[str], list[int], list[bytes | None]]:
+    """Dùng cho /all — GET ảnh full size luôn, cache content, không download lại lần 2."""
+    api_url = f"https://m.weibo.cn/statuses/show?id={post_id}"
+
+    async with httpx.AsyncClient(headers=HEADERS_API, follow_redirects=True) as client:
+        try:
+            resp = await client.get(api_url, timeout=15)
+            data = resp.json()
+            post_data = data.get("data", {})
+
+            pics = post_data.get("pics", [])
+            pics_more = post_data.get("pics_more", [])
+            all_pics = pics + pics_more
+
+            tasks = []
+            for pic in all_pics:
+                pid = pic.get("pid", "")
+                if pid:
+                    tasks.append(get_best_url_with_content(pid))
+                else:
+                    fallback = pic.get("large", {}).get("url") or pic.get("url", "")
+                    async def _fallback(u=fallback):
+                        b = await download_image(u)
+                        return (u, len(b) if b else 0, b)
+                    tasks.append(_fallback())
+
+            results = await asyncio.gather(*tasks)
+            raw_urls     = [u for u, s, b in results]
+            raw_sizes    = [s for u, s, b in results]
+            raw_contents = [b for u, s, b in results]
+
+        except Exception as e:
+            print(f"[Scraper Error] {e}")
+            import traceback
+            traceback.print_exc()
+            return [], [], []
+
+    return raw_urls, raw_sizes, raw_contents
 
 def get_filename_from_url(url: str) -> str:
     match = re.search(r"/([^/]+\.(?:jpg|jpeg|png|gif|webp))$", url, re.IGNORECASE)
@@ -232,10 +312,14 @@ async def show_preview(bot: Bot, chat_id: int, reply_to_message_id: int, url: st
         reply_markup=keyboard_all
     )
 
-async def download_and_send_all(bot: Bot, chat_id: int, raw_urls: list, raw_sizes: list):
+async def download_and_send_all(bot: Bot, chat_id: int, raw_urls: list, raw_sizes: list, raw_contents: list | None = None):
+    """Gửi tuần tự từng ảnh. Nếu raw_contents có sẵn thì dùng luôn, không download lại."""
     success = 0
     for i, (img_url, size) in enumerate(zip(raw_urls, raw_sizes)):
-        b = await download_image(img_url)
+        # Dùng content cache nếu có (từ get_raw_images_for_download)
+        b = raw_contents[i] if raw_contents else None
+        if b is None:
+            b = await download_image(img_url)
         if b:
             try:
                 await send_as_file(
@@ -290,12 +374,12 @@ async def process_update(update_data: dict):
             await bot.send_message(chat_id=update.effective_chat.id, text="❌ Không nhận ra link Weibo.")
             return
         msg = await bot.send_message(chat_id=update.effective_chat.id, text="⬇️ Đang xử lý...")
-        thumb_urls, raw_urls, raw_sizes = await get_raw_images(post_id)
+        raw_urls, raw_sizes, raw_contents = await get_raw_images_for_download(post_id)
         if not raw_urls:
             await bot.edit_message_text(chat_id=update.effective_chat.id, message_id=msg.message_id, text="❌ Không tìm thấy ảnh nào.")
             return
         await bot.edit_message_text(chat_id=update.effective_chat.id, message_id=msg.message_id, text=f"📦 Tìm thấy {len(raw_urls)} ảnh, đang tải...")
-        await download_and_send_all(bot, update.effective_chat.id, raw_urls, raw_sizes)
+        await download_and_send_all(bot, update.effective_chat.id, raw_urls, raw_sizes, raw_contents)
         return
 
     # URL message
@@ -314,13 +398,13 @@ async def process_update(update_data: dict):
 
         if cb.startswith("dl_all:"):
             post_id = cb[len("dl_all:"):]
-            await bot.send_message(chat_id=chat_id, text="⬇️ Đang scrape lại và tải ảnh...")
-            thumb_urls, raw_urls, raw_sizes = await get_raw_images(post_id)
+            await bot.send_message(chat_id=chat_id, text="⬇️ Đang tải ảnh full size...")
+            raw_urls, raw_sizes, raw_contents = await get_raw_images_for_download(post_id)
             if not raw_urls:
                 await bot.send_message(chat_id=chat_id, text="❌ Không tìm thấy ảnh nào.")
                 return
-            await bot.send_message(chat_id=chat_id, text=f"📦 {len(raw_urls)} ảnh, đang tải...")
-            await download_and_send_all(bot, chat_id, raw_urls, raw_sizes)
+            await bot.send_message(chat_id=chat_id, text=f"📦 {len(raw_urls)} ảnh, đang upload...")
+            await download_and_send_all(bot, chat_id, raw_urls, raw_sizes, raw_contents)
 
         elif cb.startswith("dl_one:"):
             parts = cb.split(":")
