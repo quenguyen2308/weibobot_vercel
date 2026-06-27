@@ -397,7 +397,7 @@ async def run_download_all_flow(bot: Bot, chat_id: int, post_id: str):
         await bot.send_message(chat_id=chat_id, text="❌ Không tìm thấy ảnh nào.")
         return
 
-    await bot.send_message(chat_id=chat_id, text=f"📦 {len(raw_urls)} ảnh, đang upload...")
+    await bot.send_message(chat_id=chat_id, text=f"📥 Đang tải {len(raw_urls)} ảnh...")
 
     try:
         await asyncio.wait_for(
@@ -467,7 +467,6 @@ async def process_update(update_data: dict):
 
         if cb.startswith("dl_all:"):
             post_id = cb[len("dl_all:"):]
-            await bot.send_message(chat_id=chat_id, text="⬇️ Đang tải ảnh full size...")
             await run_download_all_flow(bot, chat_id, post_id)
 
         elif cb.startswith("dl_one:"):
@@ -475,7 +474,7 @@ async def process_update(update_data: dict):
             # format: dl_one:<post_id>:<index>
             post_id = parts[1]
             idx = int(parts[2])
-            await bot.send_message(chat_id=chat_id, text=f"⬇️ Đang tải ảnh #{idx+1}...")
+            await bot.send_message(chat_id=chat_id, text=f"📥 Đang tải ảnh #{idx+1}...")
             _, raw_urls, raw_sizes = await get_raw_images(post_id)
             if idx >= len(raw_urls):
                 await bot.send_message(chat_id=chat_id, text="❌ Index không hợp lệ.")
