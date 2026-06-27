@@ -17,6 +17,20 @@ from http.server import BaseHTTPRequestHandler
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
+# ─── TIMEOUT AN TOÀN CHO TÁC VỤ NẶNG ───────────────────────────────────────────
+# Vercel sẽ KILL THẲNG tiến trình (không phải exception Python) nếu function
+# chạy quá `maxDuration` cấu hình trong vercel.json — lúc đó bot không kịp gửi
+# tin báo lỗi, chat sẽ treo im lặng mãi ở message cuối (đúng là bug đã gặp).
+#
+# Giải pháp: tự đặt timeout NỘI BỘ nhỏ hơn maxDuration vài chục giây, để nếu
+# sắp chạm giới hạn, bot kịp gửi tin báo lỗi cho user trước khi Vercel kill.
+#
+# Đặt giá trị này khớp với maxDuration trong vercel.json (xem ghi chú dưới đó):
+#   - Hobby (không Fluid Compute): maxDuration=60   → HEAVY_TASK_TIMEOUT_SEC=40
+#   - Pro / Enterprise:             maxDuration=300  → HEAVY_TASK_TIMEOUT_SEC=270
+#   - Pro / Enterprise (Fluid, GA): maxDuration=800  → HEAVY_TASK_TIMEOUT_SEC=760
+HEAVY_TASK_TIMEOUT_SEC = int(os.environ.get("HEAVY_TASK_TIMEOUT_SEC", "270"))
+
 HEADERS_API = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
     "Referer": "https://m.weibo.cn/",
@@ -327,29 +341,73 @@ async def show_preview(bot: Bot, chat_id: int, reply_to_message_id: int, url: st
         reply_markup=keyboard_all
     )
 
-async def download_and_send_all(bot: Bot, chat_id: int, raw_urls: list, raw_sizes: list, raw_contents: list | None = None):
-    """Gửi tuần tự từng ảnh. Nếu raw_contents có sẵn thì dùng luôn, không download lại."""
-    success = 0
-    for i, (img_url, size) in enumerate(zip(raw_urls, raw_sizes)):
-        # Dùng content cache nếu có (từ get_raw_images_for_download)
-        b = raw_contents[i] if raw_contents else None
-        if b is None:
-            b = await download_image(img_url)
-        if b:
-            try:
-                await send_as_file(
-                    bot, chat_id, b,
-                    filename=get_filename_from_url(img_url),
-                    caption=f"#{i+1} — {format_size(size)}"
-                )
-                success += 1
-            except Exception as e:
-                await bot.send_message(chat_id=chat_id, text=f"⚠️ Không upload được ảnh #{i+1}: {e}")
-        else:
-            await bot.send_message(chat_id=chat_id, text=f"⚠️ Không tải được ảnh #{i+1}: {img_url}")
-        await asyncio.sleep(0.8)
+async def download_and_send_all(bot: Bot, chat_id: int, raw_urls: list, raw_sizes: list, raw_contents: list | None = None, concurrency: int = 3):
+    """Upload ảnh với tối đa `concurrency` request đồng thời, thay vì tuần tự
+    từng ảnh kèm sleep 0.8s. Với album nhiều ảnh nặng (>10MB/ảnh), kiểu tuần
+    tự cũ rất dễ khiến tổng thời gian vượt maxDuration của Vercel → bị kill
+    giữa chừng mà không báo lỗi. Song song hoá giúp giảm mạnh wall-clock time."""
+    semaphore = asyncio.Semaphore(concurrency)
+    success_count = 0
+    counter_lock = asyncio.Lock()
 
-    await bot.send_message(chat_id=chat_id, text=f"✅ Hoàn tất: {success}/{len(raw_urls)} ảnh")
+    async def _send_one(i: int, img_url: str, size: int):
+        nonlocal success_count
+        async with semaphore:
+            # Dùng content cache nếu có (từ get_raw_images_for_download)
+            b = raw_contents[i] if raw_contents else None
+            if b is None:
+                b = await download_image(img_url)
+            if b:
+                try:
+                    await send_as_file(
+                        bot, chat_id, b,
+                        filename=get_filename_from_url(img_url),
+                        caption=f"#{i+1} — {format_size(size)}"
+                    )
+                    async with counter_lock:
+                        success_count += 1
+                except Exception as e:
+                    await bot.send_message(chat_id=chat_id, text=f"⚠️ Không upload được ảnh #{i+1}: {e}")
+            else:
+                await bot.send_message(chat_id=chat_id, text=f"⚠️ Không tải được ảnh #{i+1}: {img_url}")
+
+    await asyncio.gather(*[
+        _send_one(i, url, size) for i, (url, size) in enumerate(zip(raw_urls, raw_sizes))
+    ])
+
+    await bot.send_message(chat_id=chat_id, text=f"✅ Hoàn tất: {success_count}/{len(raw_urls)} ảnh")
+
+async def run_download_all_flow(bot: Bot, chat_id: int, post_id: str):
+    """Dùng chung cho cả /all và nút Download All. Bọc timeout NỘI BỘ
+    (HEAVY_TASK_TIMEOUT_SEC) quanh 2 bước nặng nhất — nếu sắp chạm giới hạn
+    maxDuration của Vercel, bot sẽ báo lỗi rõ ràng thay vì bị kill im lặng."""
+    try:
+        raw_urls, raw_sizes, raw_contents = await asyncio.wait_for(
+            get_raw_images_for_download(post_id), timeout=HEAVY_TASK_TIMEOUT_SEC
+        )
+    except asyncio.TimeoutError:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="⏱ Quá thời gian khi tải ảnh gốc từ Weibo (hàm serverless bị giới hạn thời gian chạy). Thử lại sau hoặc tải từng ảnh bằng nút riêng."
+        )
+        return
+
+    if not raw_urls:
+        await bot.send_message(chat_id=chat_id, text="❌ Không tìm thấy ảnh nào.")
+        return
+
+    await bot.send_message(chat_id=chat_id, text=f"📦 {len(raw_urls)} ảnh, đang upload...")
+
+    try:
+        await asyncio.wait_for(
+            download_and_send_all(bot, chat_id, raw_urls, raw_sizes, raw_contents),
+            timeout=HEAVY_TASK_TIMEOUT_SEC
+        )
+    except asyncio.TimeoutError:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="⏱ Quá thời gian upload (hàm serverless bị Vercel giới hạn maxDuration). Album quá nhiều/nặng ảnh — hãy thử tải từng ảnh bằng nút riêng, hoặc tăng maxDuration nếu plan cho phép."
+        )
 
 async def process_update(update_data: dict):
     request = HTTPXRequest(
@@ -389,12 +447,7 @@ async def process_update(update_data: dict):
             await bot.send_message(chat_id=update.effective_chat.id, text="❌ Không nhận ra link Weibo.")
             return
         msg = await bot.send_message(chat_id=update.effective_chat.id, text="⬇️ Đang xử lý...")
-        raw_urls, raw_sizes, raw_contents = await get_raw_images_for_download(post_id)
-        if not raw_urls:
-            await bot.edit_message_text(chat_id=update.effective_chat.id, message_id=msg.message_id, text="❌ Không tìm thấy ảnh nào.")
-            return
-        await bot.edit_message_text(chat_id=update.effective_chat.id, message_id=msg.message_id, text=f"📦 Tìm thấy {len(raw_urls)} ảnh, đang tải...")
-        await download_and_send_all(bot, update.effective_chat.id, raw_urls, raw_sizes, raw_contents)
+        await run_download_all_flow(bot, update.effective_chat.id, post_id)
         return
 
     # URL message
@@ -414,12 +467,7 @@ async def process_update(update_data: dict):
         if cb.startswith("dl_all:"):
             post_id = cb[len("dl_all:"):]
             await bot.send_message(chat_id=chat_id, text="⬇️ Đang tải ảnh full size...")
-            raw_urls, raw_sizes, raw_contents = await get_raw_images_for_download(post_id)
-            if not raw_urls:
-                await bot.send_message(chat_id=chat_id, text="❌ Không tìm thấy ảnh nào.")
-                return
-            await bot.send_message(chat_id=chat_id, text=f"📦 {len(raw_urls)} ảnh, đang upload...")
-            await download_and_send_all(bot, chat_id, raw_urls, raw_sizes, raw_contents)
+            await run_download_all_flow(bot, chat_id, post_id)
 
         elif cb.startswith("dl_one:"):
             parts = cb.split(":")
