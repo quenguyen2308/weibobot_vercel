@@ -219,8 +219,10 @@ async def get_raw_images(post_id: str) -> tuple[list[str], list[str], list[int]]
 
     return thumb_urls, raw_urls, raw_sizes
 
-async def get_raw_images_for_download(post_id: str) -> tuple[list[str], list[int], list[bytes | None]]:
-    """Dùng cho /all — GET ảnh full size luôn, cache content, không download lại lần 2."""
+async def fetch_pics_meta(post_id: str) -> list[dict]:
+    """Chỉ gọi API Weibo để lấy danh sách metadata ảnh (pics + pics_more),
+    KHÔNG tải nội dung ảnh nào — dùng để biết tổng số ảnh và validate
+    số thứ tự user chọn trước khi tải nặng."""
     api_url = f"https://m.weibo.cn/statuses/show?id={post_id}"
 
     async with httpx.AsyncClient(headers=HEADERS_API, follow_redirects=True) as client:
@@ -228,35 +230,40 @@ async def get_raw_images_for_download(post_id: str) -> tuple[list[str], list[int
             resp = await client.get(api_url, timeout=15)
             data = resp.json()
             post_data = data.get("data", {})
-
             pics = post_data.get("pics", [])
             pics_more = post_data.get("pics_more", [])
-            all_pics = pics + pics_more
-
-            tasks = []
-            for pic in all_pics:
-                pid = pic.get("pid", "")
-                if pid:
-                    tasks.append(get_best_url_with_content(pid))
-                else:
-                    fallback = pic.get("large", {}).get("url") or pic.get("url", "")
-                    async def _fallback(u=fallback):
-                        b = await download_image(u)
-                        return (u, len(b) if b else 0, b)
-                    tasks.append(_fallback())
-
-            results = await asyncio.gather(*tasks)
-            raw_urls     = [u for u, s, b in results]
-            raw_sizes    = [s for u, s, b in results]
-            raw_contents = [b for u, s, b in results]
-
+            return pics + pics_more
         except Exception as e:
             print(f"[Scraper Error] {e}")
             import traceback
             traceback.print_exc()
-            return [], [], []
+            return []
 
-    return raw_urls, raw_sizes, raw_contents
+async def fetch_content_for_pics(
+    selected_pics: list[tuple[int, dict]]
+) -> tuple[list[int], list[str], list[int], list[bytes | None]]:
+    """Dùng cho /a — GET ảnh full size cho đúng các pic đã chọn, cache content,
+    không download lại lần 2. `selected_pics` là list (index_gốc, pic_dict).
+    Trả về orig_indices song song với url/size/content để giữ đúng số thứ tự
+    hiển thị (#N) dù chỉ tải một phần album."""
+    tasks = []
+    for _, pic in selected_pics:
+        pid = pic.get("pid", "")
+        if pid:
+            tasks.append(get_best_url_with_content(pid))
+        else:
+            fallback = pic.get("large", {}).get("url") or pic.get("url", "")
+            async def _fallback(u=fallback):
+                b = await download_image(u)
+                return (u, len(b) if b else 0, b)
+            tasks.append(_fallback())
+
+    results = await asyncio.gather(*tasks)
+    orig_indices = [i for i, _ in selected_pics]
+    raw_urls     = [u for u, s, b in results]
+    raw_sizes    = [s for u, s, b in results]
+    raw_contents = [b for u, s, b in results]
+    return orig_indices, raw_urls, raw_sizes, raw_contents
 
 def get_filename_from_url(url: str) -> str:
     match = re.search(r"/([^/]+\.(?:jpg|jpeg|png|gif|webp))$", url, re.IGNORECASE)
@@ -270,6 +277,38 @@ def format_size(size_bytes: int) -> str:
     if size_bytes >= 1024 * 1024:
         return f"{size_bytes / 1024 / 1024:.1f}MB"
     return f"{size_bytes / 1024:.0f}KB"
+
+def parse_indices(spec: str, max_n: int) -> list[int]:
+    """Parse chuỗi kiểu '1,3,5-7' (1-based, 2 đầu đều đóng) thành list index
+    0-based đã sort + dedup. Index ngoài phạm vi [1, max_n] bị bỏ qua âm thầm.
+    Raise ValueError nếu sai định dạng (không phải số / không phải khoảng N-M)."""
+    spec = spec.strip()
+    if not spec:
+        return []
+
+    result = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            bounds = part.split("-")
+            if len(bounds) != 2 or not all(b.strip().isdigit() for b in bounds):
+                raise ValueError(f"Sai định dạng khoảng: '{part}' (vd đúng: 5-7)")
+            a, b = int(bounds[0]), int(bounds[1])
+            if a > b:
+                a, b = b, a
+            for n in range(a, b + 1):
+                if 1 <= n <= max_n:
+                    result.add(n - 1)
+        else:
+            if not part.isdigit():
+                raise ValueError(f"Sai định dạng số: '{part}'")
+            n = int(part)
+            if 1 <= n <= max_n:
+                result.add(n - 1)
+
+    return sorted(result)
 
 # ─── BOT LOGIC ────────────────────────────────────────────────────────────────
 
@@ -341,13 +380,24 @@ async def show_preview(bot: Bot, chat_id: int, reply_to_message_id: int, url: st
         reply_markup=keyboard_all
     )
 
-async def download_and_send_all(bot: Bot, chat_id: int, raw_urls: list, raw_sizes: list, raw_contents: list | None = None, concurrency: int = 3):
+async def download_and_send_all(
+    bot: Bot,
+    chat_id: int,
+    orig_indices: list,
+    raw_urls: list,
+    raw_sizes: list,
+    raw_contents: list | None = None,
+    concurrency: int = 3,
+):
     """Đảm bảo có nội dung từng ảnh song song (dùng cache nếu có, download nếu
     chưa), nhưng GỬI lên Telegram tuần tự theo đúng thứ tự #1, #2, #3...
     Lý do tách riêng: nếu để send_as_file chạy song song (như bản trước), ảnh
     nhẹ upload xong trước, ảnh nặng xong sau — thứ tự hiện trong chat bị lộn,
     dù nội dung đã tải/cache xong cùng lúc. Gửi tuần tự ở đây gần như không
-    tốn thêm thời gian vì content thường đã sẵn sàng trước khi đến lượt."""
+    tốn thêm thời gian vì content thường đã sẵn sàng trước khi đến lượt.
+
+    `orig_indices[k]` là số thứ tự gốc (0-based) của raw_urls[k]/raw_sizes[k] —
+    dùng để caption đúng #N kể cả khi chỉ tải một phần album đã chọn."""
     semaphore = asyncio.Semaphore(concurrency)
     content_ready: list[bytes | None] = list(raw_contents) if raw_contents else [None] * len(raw_urls)
 
@@ -360,31 +410,63 @@ async def download_and_send_all(bot: Bot, chat_id: int, raw_urls: list, raw_size
     ensure_tasks = [asyncio.create_task(_ensure_one(i, url)) for i, url in enumerate(raw_urls)]
 
     success_count = 0
-    for i, (img_url, size) in enumerate(zip(raw_urls, raw_sizes)):
-        await ensure_tasks[i]  # thường đã xong sẵn, ít khi phải chờ thêm
-        b = content_ready[i]
+    for k, (img_url, size) in enumerate(zip(raw_urls, raw_sizes)):
+        orig_i = orig_indices[k]
+        await ensure_tasks[k]  # thường đã xong sẵn, ít khi phải chờ thêm
+        b = content_ready[k]
         if b:
             try:
                 await send_as_file(
                     bot, chat_id, b,
                     filename=get_filename_from_url(img_url),
-                    caption=f"#{i+1} — {format_size(size)}"
+                    caption=f"#{orig_i+1} — {format_size(size)}"
                 )
                 success_count += 1
             except Exception as e:
-                await bot.send_message(chat_id=chat_id, text=f"⚠️ Không upload được ảnh #{i+1}: {e}")
+                await bot.send_message(chat_id=chat_id, text=f"⚠️ Không upload được ảnh #{orig_i+1}: {e}")
         else:
-            await bot.send_message(chat_id=chat_id, text=f"⚠️ Không tải được ảnh #{i+1}: {img_url}")
+            await bot.send_message(chat_id=chat_id, text=f"⚠️ Không tải được ảnh #{orig_i+1}: {img_url}")
 
     await bot.send_message(chat_id=chat_id, text=f"✅ Hoàn tất: {success_count}/{len(raw_urls)} ảnh")
 
-async def run_download_all_flow(bot: Bot, chat_id: int, post_id: str):
-    """Dùng chung cho cả /all và nút Download All. Bọc timeout NỘI BỘ
-    (HEAVY_TASK_TIMEOUT_SEC) quanh 2 bước nặng nhất — nếu sắp chạm giới hạn
-    maxDuration của Vercel, bot sẽ báo lỗi rõ ràng thay vì bị kill im lặng."""
+async def run_download_all_flow(bot: Bot, chat_id: int, post_id: str, index_spec: str = ""):
+    """Dùng chung cho cả /a và nút Download All. Bọc timeout NỘI BỘ
+    (HEAVY_TASK_TIMEOUT_SEC) quanh các bước nặng nhất — nếu sắp chạm giới hạn
+    maxDuration của Vercel, bot sẽ báo lỗi rõ ràng thay vì bị kill im lặng.
+
+    `index_spec`: chuỗi số thứ tự user chọn (vd '1,3,5-7'), rỗng = tải hết."""
     try:
-        raw_urls, raw_sizes, raw_contents = await asyncio.wait_for(
-            get_raw_images_for_download(post_id), timeout=HEAVY_TASK_TIMEOUT_SEC
+        all_pics = await asyncio.wait_for(fetch_pics_meta(post_id), timeout=HEAVY_TASK_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="⏱ Quá thời gian khi lấy danh sách ảnh từ Weibo. Thử lại sau."
+        )
+        return
+
+    total = len(all_pics)
+    if total == 0:
+        await bot.send_message(chat_id=chat_id, text="❌ Không tìm thấy ảnh nào.")
+        return
+
+    indices = None
+    if index_spec:
+        try:
+            indices = parse_indices(index_spec, total)
+        except ValueError as e:
+            await bot.send_message(chat_id=chat_id, text=f"❌ {e}")
+            return
+        if not indices:
+            await bot.send_message(chat_id=chat_id, text="❌ Không có ảnh nào khớp với số thứ tự đã chọn.")
+            return
+
+    selected_pics = [(i, all_pics[i]) for i in indices] if indices is not None else list(enumerate(all_pics))
+
+    await bot.send_message(chat_id=chat_id, text=f"📥 Đang tải {len(selected_pics)}/{total} ảnh...")
+
+    try:
+        orig_indices, raw_urls, raw_sizes, raw_contents = await asyncio.wait_for(
+            fetch_content_for_pics(selected_pics), timeout=HEAVY_TASK_TIMEOUT_SEC
         )
     except asyncio.TimeoutError:
         await bot.send_message(
@@ -393,15 +475,9 @@ async def run_download_all_flow(bot: Bot, chat_id: int, post_id: str):
         )
         return
 
-    if not raw_urls:
-        await bot.send_message(chat_id=chat_id, text="❌ Không tìm thấy ảnh nào.")
-        return
-
-    await bot.send_message(chat_id=chat_id, text=f"📥 Đang tải {len(raw_urls)} ảnh...")
-
     try:
         await asyncio.wait_for(
-            download_and_send_all(bot, chat_id, raw_urls, raw_sizes, raw_contents),
+            download_and_send_all(bot, chat_id, orig_indices, raw_urls, raw_sizes, raw_contents),
             timeout=HEAVY_TASK_TIMEOUT_SEC
         )
     except asyncio.TimeoutError:
@@ -431,24 +507,29 @@ async def process_update(update_data: dict):
                 "🖼 Weibo Image Bot\n\n"
                 "Paste link bài post Weibo → bot hiện preview album\n"
                 "→ Bấm Download All hoặc chọn từng ảnh\n\n"
-                "/a <url> — Download All Files"
+                "/a <url> — Download tất cả ảnh\n"
+                "/a <url> 1,3,5-7 — Chỉ download các ảnh số 1, 3, 5, 6, 7"
             )
         )
         return
 
-    # /a <url>
+    # /a <url> [số thứ tự ảnh]
     if update.message and update.message.text and update.message.text.startswith("/a"):
-        parts = update.message.text.split(maxsplit=1)
+        parts = update.message.text.split(maxsplit=2)
         if len(parts) < 2:
-            await bot.send_message(chat_id=update.effective_chat.id, text="❌ Dùng: /a <weibo_url>")
+            await bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="❌ Dùng: /a <weibo_url> [số thứ tự ảnh]\nVD: /a https://weibo.com/... 1,3,5-7"
+            )
             return
         url = parts[1].strip()
+        index_spec = parts[2].strip() if len(parts) > 2 else ""
         post_id = extract_weibo_id(url)
         if not post_id:
             await bot.send_message(chat_id=update.effective_chat.id, text="❌ Không nhận ra link Weibo.")
             return
-        msg = await bot.send_message(chat_id=update.effective_chat.id, text="⬇️ Đang xử lý...")
-        await run_download_all_flow(bot, update.effective_chat.id, post_id)
+        await bot.send_message(chat_id=update.effective_chat.id, text="⬇️ Đang xử lý...")
+        await run_download_all_flow(bot, update.effective_chat.id, post_id, index_spec=index_spec)
         return
 
     # URL message
