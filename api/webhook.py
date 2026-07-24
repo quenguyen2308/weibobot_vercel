@@ -172,6 +172,28 @@ async def download_image(url: str, timeout: int = 30, retries: int = 3) -> bytes
                 break
     return None
 
+def _build_full_pic_list(post_data: dict) -> list[dict]:
+    """API mobile Weibo (`statuses/show`) đôi khi cắt field `pics` xuống tối đa
+    9 phần tử — đặc biệt với bài trộn ảnh+video (2 slot bị chiếm bởi cover
+    video), và `pics_more` cũng không được điền bù trong trường hợp đó, khiến
+    ảnh thật bị thiếu dù `pic_num`/`pic_ids` báo tổng số ảnh lớn hơn hẳn.
+
+    `pic_ids` mới là danh sách pid ẢNH THẬT đầy đủ, đáng tin cậy — dùng nó làm
+    nguồn chân lý. Với mỗi pid, mượn dữ liệu chi tiết (thumbnail, geo...) từ
+    `pics`/`pics_more` nếu có; pid nào bị thiếu do `pics` bị cắt thì tự dựng
+    thumbnail URL theo pattern chuẩn của sinaimg.cn (đã kiểm chứng qua các pid
+    có sẵn: https://wx<N>.sinaimg.cn/orj360/<pid>.jpg, subdomain N sai lệch
+    thì download_image/get_best_url đã tự fallback wx1/wx2/wx3/wx4)."""
+    pics = post_data.get("pics", [])
+    pics_more = post_data.get("pics_more", [])
+    by_pid = {p.get("pid"): p for p in pics + pics_more if p.get("pid")}
+
+    pic_ids = post_data.get("pic_ids") or list(by_pid.keys())
+    return [
+        by_pid.get(pid) or {"pid": pid, "url": f"https://wx2.sinaimg.cn/orj360/{pid}.jpg"}
+        for pid in pic_ids
+    ]
+
 async def get_raw_images(post_id: str) -> tuple[list[str], list[str], list[int]]:
     """Dùng cho preview — chỉ cần URL + size."""
     thumb_urls = []
@@ -184,9 +206,7 @@ async def get_raw_images(post_id: str) -> tuple[list[str], list[str], list[int]]
             data = resp.json()
             post_data = data.get("data", {})
 
-            pics = post_data.get("pics", [])
-            pics_more = post_data.get("pics_more", [])
-            all_pics = pics + pics_more
+            all_pics = _build_full_pic_list(post_data)
 
             tasks = []
             for pic in all_pics:
@@ -214,9 +234,9 @@ async def get_raw_images(post_id: str) -> tuple[list[str], list[str], list[int]]
     return thumb_urls, raw_urls, raw_sizes
 
 async def fetch_pics_meta(post_id: str) -> list[dict]:
-    """Chỉ gọi API Weibo để lấy danh sách metadata ảnh (pics + pics_more),
-    KHÔNG tải nội dung ảnh nào — dùng để biết tổng số ảnh và validate
-    số thứ tự user chọn trước khi tải nặng."""
+    """Chỉ gọi API Weibo để lấy danh sách metadata ẢNH ĐẦY ĐỦ (dựa trên
+    pic_ids, xem _build_full_pic_list), KHÔNG tải nội dung ảnh nào — dùng để
+    biết tổng số ảnh và validate số thứ tự user chọn trước khi tải nặng."""
     api_url = f"https://m.weibo.cn/statuses/show?id={post_id}"
 
     async with httpx.AsyncClient(headers=HEADERS_API, follow_redirects=True) as client:
@@ -224,9 +244,7 @@ async def fetch_pics_meta(post_id: str) -> list[dict]:
             resp = await client.get(api_url, timeout=15)
             data = resp.json()
             post_data = data.get("data", {})
-            pics = post_data.get("pics", [])
-            pics_more = post_data.get("pics_more", [])
-            return pics + pics_more
+            return _build_full_pic_list(post_data)
         except Exception as e:
             print(f"[Scraper Error] {e}")
             import traceback
