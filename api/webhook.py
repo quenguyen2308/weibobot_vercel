@@ -82,14 +82,16 @@ def extract_weibo_id(url: str) -> str | None:
     return None
 
 IMAGE_SIZES = ["orj1080", "mw2000", "orj480", "large", "orj360"]
-# 'large' gần như luôn là bản gốc full-size (lớn nhất) — thử riêng nó trước
-# thay vì probe cả 5 size mỗi ảnh. Probe 5 size song song x N ảnh trong 1 album
-# dễ dí CDN Weibo vào 403 hàng loạt (mỗi 403 lại kéo theo 3 lần HEAD dò
-# wx1/wx3/wx4 tuần tự bên trong _probe_size) — đây là nguồn chính khiến việc
-# tải album nhiều ảnh chậm hẳn đi và có nguy cơ vượt timeout webhook Telegram,
-# khiến Telegram tự retry cả update → xử lý/upload trùng lặp.
-PRIMARY_SIZE = "large"
-FALLBACK_SIZES = [s for s in IMAGE_SIZES if s != PRIMARY_SIZE]
+# Chỉ dò 3 size LỚN NHẤT (large/mw2000/orj1080) song song thay vì cả 5 — dò
+# hết cả 5 size x N ảnh trong 1 album nhiều ảnh (album 12 ảnh = tối đa 60 HEAD
+# request cùng lúc) dễ dí CDN Weibo vào 403 hàng loạt (mỗi 403 lại kéo theo 3
+# lần HEAD dò wx1/wx3/wx4 tuần tự bên trong _probe_size), đây là nguồn chính
+# khiến việc tải album nhiều ảnh chậm hẳn và vượt timeout webhook Telegram,
+# khiến Telegram tự retry cả update → xử lý/upload trùng lặp. orj480/orj360
+# chỉ dùng làm phương án cuối khi cả 3 size lớn đều không tải được (ảnh cũ/
+# hiếm chỉ còn size nhỏ).
+TOP_SIZES = ["large", "mw2000", "orj1080"]
+LAST_RESORT_SIZES = [s for s in IMAGE_SIZES if s not in TOP_SIZES]
 
 async def _probe_size(client: httpx.AsyncClient, pid: str, s: str) -> tuple[str, int]:
     """HEAD 1 size cụ thể, tự fallback sang wx1/wx3/wx4 nếu wx2 trả 403.
@@ -113,16 +115,18 @@ async def _probe_size(client: httpx.AsyncClient, pid: str, s: str) -> tuple[str,
     return "", 0
 
 async def _find_best_size(client: httpx.AsyncClient, pid: str) -> tuple[str, int]:
-    """Thử 'large' (bản gốc, gần như luôn lớn nhất) trước — chỉ 1 HEAD. Chỉ khi
-    'large' không tải được (thiếu / lỗi mạng) mới dò song song 4 size còn lại
-    để tìm bản lớn nhất sẵn có. Tránh probe cả 5 size mỗi ảnh — xem ghi chú ở
-    PRIMARY_SIZE/FALLBACK_SIZES phía trên."""
-    url, size = await _probe_size(client, pid, PRIMARY_SIZE)
-    if url:
-        return url, size
-
-    results = await asyncio.gather(*[_probe_size(client, pid, s) for s in FALLBACK_SIZES])
+    """Dò song song 3 size lớn nhất (TOP_SIZES), lấy size có content-length lớn
+    nhất trong số tải được. Chỉ khi cả 3 đều thất bại mới dò tiếp
+    LAST_RESORT_SIZES (2 size nhỏ còn lại) — xem ghi chú ở TOP_SIZES phía trên."""
+    results = await asyncio.gather(*[_probe_size(client, pid, s) for s in TOP_SIZES])
     best_url, best_size = "", 0
+    for u, s in results:
+        if s > best_size:
+            best_size, best_url = s, u
+    if best_url:
+        return best_url, best_size
+
+    results = await asyncio.gather(*[_probe_size(client, pid, s) for s in LAST_RESORT_SIZES])
     for u, s in results:
         if s > best_size:
             best_size, best_url = s, u
