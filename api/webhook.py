@@ -82,16 +82,29 @@ def extract_weibo_id(url: str) -> str | None:
     return None
 
 IMAGE_SIZES = ["orj1080", "mw2000", "orj480", "large", "orj360"]
-# Chỉ dò 3 size LỚN NHẤT (large/mw2000/orj1080) song song thay vì cả 5 — dò
-# hết cả 5 size x N ảnh trong 1 album nhiều ảnh (album 12 ảnh = tối đa 60 HEAD
-# request cùng lúc) dễ dí CDN Weibo vào 403 hàng loạt (mỗi 403 lại kéo theo 3
-# lần HEAD dò wx1/wx3/wx4 tuần tự bên trong _probe_size), đây là nguồn chính
-# khiến việc tải album nhiều ảnh chậm hẳn và vượt timeout webhook Telegram,
-# khiến Telegram tự retry cả update → xử lý/upload trùng lặp. orj480/orj360
-# chỉ dùng làm phương án cuối khi cả 3 size lớn đều không tải được (ảnh cũ/
-# hiếm chỉ còn size nhỏ).
-TOP_SIZES = ["large", "mw2000", "orj1080"]
-LAST_RESORT_SIZES = [s for s in IMAGE_SIZES if s not in TOP_SIZES]
+# 'large' gần như luôn là bản gốc full-size (lớn nhất) — chỉ dò 1 size này cho
+# mỗi ảnh; KHÔNG THẤY (thiếu / lỗi mạng) mới dò tiếp lần lượt các size còn lại,
+# dừng ngay khi gặp size đầu tiên tải được. Kết hợp với chunking theo
+# CHUNK_SIZE ảnh (xem _gather_in_chunks) để tránh dí quá nhiều request đồng
+# thời vào CDN Weibo khi album nhiều ảnh — đây là nguồn chính khiến việc tải
+# album nhiều ảnh chậm hẳn/403 hàng loạt và vượt timeout webhook Telegram,
+# khiến Telegram tự retry cả update → xử lý/upload trùng lặp.
+PRIMARY_SIZE = "large"
+FALLBACK_SIZES = [s for s in IMAGE_SIZES if s != PRIMARY_SIZE]
+
+# Số ảnh xử lý song song tối đa cùng lúc (probe + download) — album nhiều ảnh
+# sẽ được chia thành từng đợt CHUNK_SIZE ảnh, đợt sau chỉ chạy khi đợt trước
+# xong, thay vì bắn hết N ảnh song song một lúc.
+CHUNK_SIZE = 3
+
+async def _gather_in_chunks(coros: list, chunk_size: int = CHUNK_SIZE) -> list:
+    """Chạy danh sách coroutine theo từng đợt tối đa `chunk_size` cái song
+    song một lúc, đợi xong đợt này mới chạy đợt tiếp theo."""
+    results = []
+    for i in range(0, len(coros), chunk_size):
+        batch = coros[i:i + chunk_size]
+        results.extend(await asyncio.gather(*batch))
+    return results
 
 async def _probe_size(client: httpx.AsyncClient, pid: str, s: str) -> tuple[str, int]:
     """HEAD 1 size cụ thể, tự fallback sang wx1/wx3/wx4 nếu wx2 trả 403.
@@ -115,22 +128,19 @@ async def _probe_size(client: httpx.AsyncClient, pid: str, s: str) -> tuple[str,
     return "", 0
 
 async def _find_best_size(client: httpx.AsyncClient, pid: str) -> tuple[str, int]:
-    """Dò song song 3 size lớn nhất (TOP_SIZES), lấy size có content-length lớn
-    nhất trong số tải được. Chỉ khi cả 3 đều thất bại mới dò tiếp
-    LAST_RESORT_SIZES (2 size nhỏ còn lại) — xem ghi chú ở TOP_SIZES phía trên."""
-    results = await asyncio.gather(*[_probe_size(client, pid, s) for s in TOP_SIZES])
-    best_url, best_size = "", 0
-    for u, s in results:
-        if s > best_size:
-            best_size, best_url = s, u
-    if best_url:
-        return best_url, best_size
+    """Thử 'large' trước — chỉ 1 HEAD. Không thấy mới dò tiếp lần lượt các size
+    còn lại, dừng ngay khi gặp size đầu tiên tải được (không cần dò hết để so
+    sánh, vì 'large' vốn đã là ưu tiên số 1)."""
+    url, size = await _probe_size(client, pid, PRIMARY_SIZE)
+    if url:
+        return url, size
 
-    results = await asyncio.gather(*[_probe_size(client, pid, s) for s in LAST_RESORT_SIZES])
-    for u, s in results:
-        if s > best_size:
-            best_size, best_url = s, u
-    return best_url, best_size
+    for s in FALLBACK_SIZES:
+        url, size = await _probe_size(client, pid, s)
+        if url:
+            return url, size
+
+    return "", 0
 
 async def get_best_url(pid: str) -> tuple[str, int]:
     """Tìm URL ảnh gốc tốt nhất (dùng HEAD, không tải nội dung). Logic phải
@@ -232,7 +242,7 @@ async def get_raw_images(post_id: str) -> tuple[list[str], list[str], list[int]]
                         return (u, 0)
                     tasks.append(_fallback())
 
-            results = await asyncio.gather(*tasks)
+            results = await _gather_in_chunks(tasks)
             raw_urls = [u for u, s in results]
             raw_sizes = [s for u, s in results]
 
@@ -281,7 +291,7 @@ async def fetch_content_for_pics(
                 return (u, len(b) if b else 0, b)
             tasks.append(_fallback())
 
-    results = await asyncio.gather(*tasks)
+    results = await _gather_in_chunks(tasks)
     orig_indices = [i for i, _ in selected_pics]
     raw_urls     = [u for u, s, b in results]
     raw_sizes    = [s for u, s, b in results]
