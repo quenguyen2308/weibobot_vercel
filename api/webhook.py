@@ -11,7 +11,6 @@ import hashlib
 from telegram import (
     Update, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 )
-from telegram.ext import Application
 from telegram.request import HTTPXRequest
 from http.server import BaseHTTPRequestHandler
 
@@ -82,64 +81,57 @@ def extract_weibo_id(url: str) -> str | None:
             return m.group(1)
     return None
 
+IMAGE_SIZES = ["orj1080", "mw2000", "orj480", "large", "orj360"]
+
+async def _probe_size(client: httpx.AsyncClient, pid: str, s: str) -> tuple[str, int]:
+    """HEAD 1 size cụ thể, tự fallback sang wx1/wx3/wx4 nếu wx2 trả 403.
+    Chạy độc lập với các size khác nên có thể gọi song song qua asyncio.gather."""
+    url = f"https://wx2.sinaimg.cn/{s}/{pid}.jpg"
+    try:
+        resp = await client.head(url, timeout=8)
+        if resp.status_code == 200:
+            return url, int(resp.headers.get("content-length", 0))
+        elif resp.status_code == 403:
+            for sub in ["wx1", "wx3", "wx4"]:
+                alt = f"https://{sub}.sinaimg.cn/{s}/{pid}.jpg"
+                try:
+                    resp2 = await client.head(alt, timeout=8)
+                    if resp2.status_code == 200:
+                        return alt, int(resp2.headers.get("content-length", 0))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return "", 0
+
 async def get_best_url(pid: str) -> tuple[str, int]:
     """Tìm URL có content-length LỚN NHẤT trong các size khả dụng (dùng HEAD,
     không tải nội dung). Logic phải đồng nhất với get_best_url_with_content
     (dùng cho /all) — nếu không, size hiển thị trên nút sẽ sai vì sẽ trả về
     ngay khi gặp variant đầu tiên (orj1080 — bản resize nhỏ) thay vì so sánh
-    để tìm bản gốc 'large' (size thật, thường lớn hơn nhiều)."""
-    sizes = ["orj1080", "mw2000", "orj480", "large", "orj360"]
-    best_url, best_size = "", 0
+    để tìm bản gốc 'large' (size thật, thường lớn hơn nhiều).
 
+    Dò cả 5 size SONG SONG (thay vì tuần tự) — mỗi HEAD tốn tới vài trăm ms -
+    8s, chạy tuần tự cho 1 ảnh có thể mất tới 5x thời gian so với chạy song song."""
     async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as client:
-        for s in sizes:
-            url = f"https://wx2.sinaimg.cn/{s}/{pid}.jpg"
-            try:
-                resp = await client.head(url, timeout=8)
-                if resp.status_code == 200:
-                    size = int(resp.headers.get("content-length", 0))
-                    if size > best_size:
-                        best_size, best_url = size, url
-                elif resp.status_code == 403:
-                    for sub in ["wx1", "wx3", "wx4"]:
-                        alt = f"https://{sub}.sinaimg.cn/{s}/{pid}.jpg"
-                        resp2 = await client.head(alt, timeout=8)
-                        if resp2.status_code == 200:
-                            size = int(resp2.headers.get("content-length", 0))
-                            if size > best_size:
-                                best_size, best_url = size, alt
-                            break
-            except:
-                pass
+        results = await asyncio.gather(*[_probe_size(client, pid, s) for s in IMAGE_SIZES])
 
+    best_url, best_size = "", 0
+    for url, size in results:
+        if size > best_size:
+            best_size, best_url = size, url
     return best_url, best_size
 
 async def get_best_url_with_content(pid: str) -> tuple[str, int, bytes | None]:
-    """Dùng cho /all — HEAD để tìm URL lớn nhất, rồi GET 1 lần duy nhất."""
-    sizes = ["orj1080", "mw2000", "orj480", "large", "orj360"]
-    best_url, best_size = "", 0
-
+    """Dùng cho /all — HEAD (song song) để tìm URL lớn nhất, rồi GET 1 lần duy nhất."""
     async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as client:
-        # Bước 1: HEAD để tìm URL lớn nhất
-        for s in sizes:
-            url = f"https://wx2.sinaimg.cn/{s}/{pid}.jpg"
-            try:
-                resp = await client.head(url, timeout=8)
-                if resp.status_code == 200:
-                    size = int(resp.headers.get("content-length", 0))
-                    if size > best_size:
-                        best_size, best_url = size, url
-                elif resp.status_code == 403:
-                    for sub in ["wx1", "wx3", "wx4"]:
-                        alt = f"https://{sub}.sinaimg.cn/{s}/{pid}.jpg"
-                        resp2 = await client.head(alt, timeout=8)
-                        if resp2.status_code == 200:
-                            size = int(resp2.headers.get("content-length", 0))
-                            if size > best_size:
-                                best_size, best_url = size, alt
-                            break
-            except:
-                pass
+        # Bước 1: HEAD song song để tìm URL lớn nhất
+        results = await asyncio.gather(*[_probe_size(client, pid, s) for s in IMAGE_SIZES])
+
+        best_url, best_size = "", 0
+        for url, size in results:
+            if size > best_size:
+                best_size, best_url = size, url
 
         if not best_url:
             return "", 0, None
@@ -156,8 +148,10 @@ async def get_best_url_with_content(pid: str) -> tuple[str, int, bytes | None]:
     return "", 0, None
 
 async def download_image(url: str, timeout: int = 30, retries: int = 3) -> bytes | None:
-    for attempt in range(retries):
-        async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as client:
+    """1 client dùng chung cho cả các lần retry — tránh bắt tay TLS lại từ đầu
+    mỗi lần thử, tận dụng connection keep-alive của httpx."""
+    async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as client:
+        for attempt in range(retries):
             try:
                 resp = await client.get(url, timeout=timeout)
                 if resp.status_code == 200:
@@ -494,8 +488,7 @@ async def process_update(update_data: dict):
         connect_timeout=30,
         pool_timeout=30,
     )
-    app = Application.builder().token(BOT_TOKEN).request(request).build()
-    bot = app.bot
+    bot = Bot(token=BOT_TOKEN, request=request)
 
     update = Update.de_json(update_data, bot)
 
