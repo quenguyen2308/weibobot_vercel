@@ -82,6 +82,14 @@ def extract_weibo_id(url: str) -> str | None:
     return None
 
 IMAGE_SIZES = ["orj1080", "mw2000", "orj480", "large", "orj360"]
+# 'large' gần như luôn là bản gốc full-size (lớn nhất) — thử riêng nó trước
+# thay vì probe cả 5 size mỗi ảnh. Probe 5 size song song x N ảnh trong 1 album
+# dễ dí CDN Weibo vào 403 hàng loạt (mỗi 403 lại kéo theo 3 lần HEAD dò
+# wx1/wx3/wx4 tuần tự bên trong _probe_size) — đây là nguồn chính khiến việc
+# tải album nhiều ảnh chậm hẳn đi và có nguy cơ vượt timeout webhook Telegram,
+# khiến Telegram tự retry cả update → xử lý/upload trùng lặp.
+PRIMARY_SIZE = "large"
+FALLBACK_SIZES = [s for s in IMAGE_SIZES if s != PRIMARY_SIZE]
 
 async def _probe_size(client: httpx.AsyncClient, pid: str, s: str) -> tuple[str, int]:
     """HEAD 1 size cụ thể, tự fallback sang wx1/wx3/wx4 nếu wx2 trả 403.
@@ -104,34 +112,33 @@ async def _probe_size(client: httpx.AsyncClient, pid: str, s: str) -> tuple[str,
         pass
     return "", 0
 
-async def get_best_url(pid: str) -> tuple[str, int]:
-    """Tìm URL có content-length LỚN NHẤT trong các size khả dụng (dùng HEAD,
-    không tải nội dung). Logic phải đồng nhất với get_best_url_with_content
-    (dùng cho /all) — nếu không, size hiển thị trên nút sẽ sai vì sẽ trả về
-    ngay khi gặp variant đầu tiên (orj1080 — bản resize nhỏ) thay vì so sánh
-    để tìm bản gốc 'large' (size thật, thường lớn hơn nhiều).
+async def _find_best_size(client: httpx.AsyncClient, pid: str) -> tuple[str, int]:
+    """Thử 'large' (bản gốc, gần như luôn lớn nhất) trước — chỉ 1 HEAD. Chỉ khi
+    'large' không tải được (thiếu / lỗi mạng) mới dò song song 4 size còn lại
+    để tìm bản lớn nhất sẵn có. Tránh probe cả 5 size mỗi ảnh — xem ghi chú ở
+    PRIMARY_SIZE/FALLBACK_SIZES phía trên."""
+    url, size = await _probe_size(client, pid, PRIMARY_SIZE)
+    if url:
+        return url, size
 
-    Dò cả 5 size SONG SONG (thay vì tuần tự) — mỗi HEAD tốn tới vài trăm ms -
-    8s, chạy tuần tự cho 1 ảnh có thể mất tới 5x thời gian so với chạy song song."""
-    async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as client:
-        results = await asyncio.gather(*[_probe_size(client, pid, s) for s in IMAGE_SIZES])
-
+    results = await asyncio.gather(*[_probe_size(client, pid, s) for s in FALLBACK_SIZES])
     best_url, best_size = "", 0
-    for url, size in results:
-        if size > best_size:
-            best_size, best_url = size, url
+    for u, s in results:
+        if s > best_size:
+            best_size, best_url = s, u
     return best_url, best_size
 
-async def get_best_url_with_content(pid: str) -> tuple[str, int, bytes | None]:
-    """Dùng cho /all — HEAD (song song) để tìm URL lớn nhất, rồi GET 1 lần duy nhất."""
+async def get_best_url(pid: str) -> tuple[str, int]:
+    """Tìm URL ảnh gốc tốt nhất (dùng HEAD, không tải nội dung). Logic phải
+    đồng nhất với get_best_url_with_content (dùng cho /all) để size hiển thị
+    trên nút không bị lệch với size thật sự tải."""
     async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as client:
-        # Bước 1: HEAD song song để tìm URL lớn nhất
-        results = await asyncio.gather(*[_probe_size(client, pid, s) for s in IMAGE_SIZES])
+        return await _find_best_size(client, pid)
 
-        best_url, best_size = "", 0
-        for url, size in results:
-            if size > best_size:
-                best_size, best_url = size, url
+async def get_best_url_with_content(pid: str) -> tuple[str, int, bytes | None]:
+    """Dùng cho /all — HEAD để tìm URL tốt nhất, rồi GET 1 lần duy nhất."""
+    async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as client:
+        best_url, best_size = await _find_best_size(client, pid)
 
         if not best_url:
             return "", 0, None
