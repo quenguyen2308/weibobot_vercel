@@ -10,6 +10,7 @@ Telegram bot cho phép người dùng dán link bài post Weibo, bot scrape ản
 - **2 endpoint tách biệt** để tránh Telegram tự retry update khi xử lý lâu:
   - `/api/webhook`: Telegram gọi vào đây, chỉ dispatch update sang `/api/process` rồi ACK ngay (vài trăm ms), không chờ xử lý nặng.
   - `/api/process`: chạy `process_update()` thật sự (scrape, tải, upload ảnh) ở 1 invocation Vercel riêng, có trọn `HEAVY_TASK_TIMEOUT_SEC` để xử lý. Chỉ nhận request có header `X-Internal-Secret` hợp lệ (do `/api/webhook` tự sinh từ `BOT_TOKEN`), không expose công khai cho ai gọi trực tiếp được.
+  - `dispatch_to_worker()` tự gọi sang `/api/process` bằng chính `Host` header của request Telegram vừa gửi tới (KHÔNG dùng env var `VERCEL_URL`) — vì `VERCEL_URL` trỏ tới domain riêng của từng deployment (`...-<hash>-<team>.vercel.app`), domain này bị Vercel **Deployment Protection** chặn 401 kể cả ở production; chỉ domain alias chính (domain Telegram đang gọi) mới public.
 
 ```
 Telegram ──POST /api/webhook──▶ handler.do_POST ──▶ dispatch_to_worker() ──▶ ACK ngay cho Telegram
@@ -70,7 +71,7 @@ Giá trị khuyến nghị khớp với `maxDuration` trong `vercel.json`:
 
 `HEAVY_TASK_TIMEOUT_SEC` chỉ bảo vệ khỏi bị **Vercel** kill; nó không giúp gì với timeout riêng của **Telegram** khi chờ webhook phản hồi (ngắn hơn nhiều — quan sát thực tế ~1 phút). Nếu `/api/webhook` tự xử lý nặng và không kịp trả lời trong khoảng đó, Telegram sẽ tự gửi lại nguyên update → chạy trùng, ảnh/tin nhắn gửi ra gấp đôi. Đây là lý do tách `/api/webhook` (chỉ ACK) khỏi `/api/process` (xử lý nặng) ở trên — `/api/webhook` luôn phản hồi rất nhanh bất kể `/api/process` chạy bao lâu.
 
-> Giả định chưa kiểm chứng 100%: cách này dựa vào việc Vercel vẫn chạy tiếp `/api/process` tới khi xong dù client gọi nó (`dispatch_to_worker`) đã bỏ qua chờ response sau `timeout=20`. Nên theo dõi log sau khi deploy để chắc `/api/process` thật sự hoàn tất thay vì bị cắt giữa chừng.
+> Đã kiểm chứng trên production: Vercel vẫn chạy tiếp `/api/process` tới khi xong dù client gọi nó (`dispatch_to_worker`) bỏ qua chờ response sau `timeout=20`. Lưu ý đã gặp thực tế: nếu dispatch dùng env var `VERCEL_URL` thay vì `Host` header, request sẽ bị Vercel Deployment Protection trả về 401 (âm thầm, không raise exception vì code không check status) — xem lý do ở phần Kiến trúc.
 
 ## Callback data encoding
 

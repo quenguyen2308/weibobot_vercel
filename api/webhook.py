@@ -656,21 +656,26 @@ async def process_update(update_data: dict):
 # vài trăm ms bất kể tác vụ nặng mất bao lâu.
 INTERNAL_DISPATCH_SECRET = hashlib.sha256(f"dispatch:{BOT_TOKEN}".encode()).hexdigest()
 
-async def dispatch_to_worker(update_data: dict):
-    base_url = os.environ.get("VERCEL_URL")
-    if not base_url:
-        # Không có base URL public (vd chạy local) → xử lý luôn tại chỗ.
+async def dispatch_to_worker(update_data: dict, host: str | None):
+    # Dùng chính Host header của request Telegram vừa gọi vào /api/webhook,
+    # KHÔNG dùng env var VERCEL_URL — VERCEL_URL trỏ tới domain riêng của
+    # từng deployment (dạng ...-<hash>-<team>.vercel.app), domain này bị
+    # Vercel Deployment Protection chặn (401) kể cả ở production, chỉ domain
+    # alias chính (domain Telegram đang gọi) mới public.
+    if not host:
+        # Không có Host header (vd gọi trực tiếp/local) → xử lý luôn tại chỗ.
         await process_update(update_data)
         return
-    if not base_url.startswith("http"):
-        base_url = f"https://{base_url}"
+    base_url = f"https://{host}"
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            await client.post(
+            resp = await client.post(
                 f"{base_url}/api/process",
                 json=update_data,
                 headers={"X-Internal-Secret": INTERNAL_DISPATCH_SECRET},
             )
+            if resp.status_code != 200:
+                print(f"[Dispatch Error] /api/process trả về {resp.status_code}: {resp.text[:300]}")
     except (httpx.ReadTimeout, httpx.ConnectTimeout):
         # Request đã được Vercel nhận và bắt đầu invocation /api/process rồi
         # — không cần chờ nó xử lý/upload ảnh xong mới trả lời Telegram.
@@ -690,7 +695,7 @@ class handler(BaseHTTPRequestHandler):
         try:
             update_data = json.loads(body)
             if self.path == "/api/webhook":
-                asyncio.run(dispatch_to_worker(update_data))
+                asyncio.run(dispatch_to_worker(update_data, self.headers.get("Host")))
             else:
                 if self.headers.get("X-Internal-Secret") != INTERNAL_DISPATCH_SECRET:
                     self.send_response(403)
