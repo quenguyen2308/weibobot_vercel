@@ -12,6 +12,10 @@
       "dest": "api/webhook.py"
     },
     {
+      "src": "/api/process",
+      "dest": "api/webhook.py"
+    },
+    {
       "src": "/",
       "dest": "api/webhook.py"
     }
