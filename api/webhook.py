@@ -94,8 +94,10 @@ FALLBACK_SIZES = [s for s in IMAGE_SIZES if s != PRIMARY_SIZE]
 
 # Số ảnh xử lý song song tối đa cùng lúc (probe + download) — album nhiều ảnh
 # sẽ được chia thành từng đợt CHUNK_SIZE ảnh, đợt sau chỉ chạy khi đợt trước
-# xong, thay vì bắn hết N ảnh song song một lúc.
-CHUNK_SIZE = 3
+# xong, thay vì bắn hết N ảnh song song một lúc. Trước đây để 3 vì còn dò cả 5
+# size x N ảnh cùng lúc (dễ 403 hàng loạt); giờ mỗi ảnh chỉ dò 1 HEAD ('large')
+# ở best-case nên nới lên 8 vẫn an toàn, giảm số đợt tuần tự.
+CHUNK_SIZE = 8
 
 async def _gather_in_chunks(coros: list, chunk_size: int = CHUNK_SIZE) -> list:
     """Chạy danh sách coroutine theo từng đợt tối đa `chunk_size` cái song
@@ -142,39 +144,59 @@ async def _find_best_size(client: httpx.AsyncClient, pid: str) -> tuple[str, int
 
     return "", 0
 
-async def get_best_url(pid: str) -> tuple[str, int]:
+async def get_best_url(pid: str, client: httpx.AsyncClient | None = None) -> tuple[str, int]:
     """Tìm URL ảnh gốc tốt nhất (dùng HEAD, không tải nội dung). Logic phải
     đồng nhất với get_best_url_with_content (dùng cho /all) để size hiển thị
-    trên nút không bị lệch với size thật sự tải."""
-    async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as client:
+    trên nút không bị lệch với size thật sự tải.
+
+    Nhận `client` dùng chung từ ngoài (khi dò nhiều ảnh liên tiếp) để tái sử
+    dụng kết nối keep-alive, tránh bắt tay TLS lại cho mỗi ảnh; không truyền
+    vào thì tự tạo client riêng."""
+    if client is not None:
         return await _find_best_size(client, pid)
+    async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as own_client:
+        return await _find_best_size(own_client, pid)
 
-async def get_best_url_with_content(pid: str) -> tuple[str, int, bytes | None]:
-    """Dùng cho /all — HEAD để tìm URL tốt nhất, rồi GET 1 lần duy nhất."""
-    async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as client:
-        best_url, best_size = await _find_best_size(client, pid)
+async def get_best_url_with_content(pid: str, client: httpx.AsyncClient | None = None) -> tuple[str, int, bytes | None]:
+    """Dùng cho /all — HEAD để tìm URL tốt nhất, rồi GET 1 lần duy nhất.
 
+    Nhận `client` dùng chung từ ngoài (xem get_best_url) để tránh mỗi ảnh tự
+    bắt tay TLS riêng khi dò+tải cả loạt ảnh."""
+    async def _run(c: httpx.AsyncClient) -> tuple[str, int, bytes | None]:
+        best_url, best_size = await _find_best_size(c, pid)
         if not best_url:
             return "", 0, None
-
         # Bước 2: GET 1 lần duy nhất URL tốt nhất
         try:
-            resp = await client.get(best_url, timeout=60)
+            resp = await c.get(best_url, timeout=60)
             if resp.status_code == 200:
                 data = resp.content
                 return best_url, len(data), data
         except Exception as e:
             print(f"[get_best_url_with_content] GET failed: {best_url} — {e}")
+        return "", 0, None
 
-    return "", 0, None
+    if client is not None:
+        return await _run(client)
+    async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as own_client:
+        return await _run(own_client)
 
-async def download_image(url: str, timeout: int = 30, retries: int = 3) -> bytes | None:
+async def download_image(
+    url: str,
+    timeout: int = 30,
+    retries: int = 3,
+    client: httpx.AsyncClient | None = None,
+) -> bytes | None:
     """1 client dùng chung cho cả các lần retry — tránh bắt tay TLS lại từ đầu
-    mỗi lần thử, tận dụng connection keep-alive của httpx."""
-    async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as client:
+    mỗi lần thử, tận dụng connection keep-alive của httpx.
+
+    Nhận `client` dùng chung từ ngoài (khi tải nhiều ảnh cùng lúc) để tái sử
+    dụng connection pool thay vì mỗi ảnh tự bắt tay TLS riêng; không truyền
+    vào thì tự tạo client riêng."""
+    async def _run(c: httpx.AsyncClient) -> bytes | None:
         for attempt in range(retries):
             try:
-                resp = await client.get(url, timeout=timeout)
+                resp = await c.get(url, timeout=timeout)
                 if resp.status_code == 200:
                     return resp.content
                 elif resp.status_code == 403:
@@ -182,7 +204,7 @@ async def download_image(url: str, timeout: int = 30, retries: int = 3) -> bytes
                         alt_url = re.sub(r"wx\d\.sinaimg\.cn", f"{sub}.sinaimg.cn", url)
                         if alt_url == url:
                             continue
-                        resp2 = await client.get(alt_url, timeout=timeout)
+                        resp2 = await c.get(alt_url, timeout=timeout)
                         if resp2.status_code == 200:
                             return resp2.content
             except (httpx.ReadTimeout, httpx.ConnectTimeout):
@@ -191,7 +213,12 @@ async def download_image(url: str, timeout: int = 30, retries: int = 3) -> bytes
             except Exception as e:
                 print(f"[Download Error] {url} — {e}")
                 break
-    return None
+        return None
+
+    if client is not None:
+        return await _run(client)
+    async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as own_client:
+        return await _run(own_client)
 
 def _build_full_pic_list(post_data: dict) -> list[dict]:
     """API mobile Weibo (`statuses/show`) đôi khi cắt field `pics` xuống tối đa
@@ -229,20 +256,24 @@ async def get_raw_images(post_id: str) -> tuple[list[str], list[str], list[int]]
 
             all_pics = _build_full_pic_list(post_data)
 
-            tasks = []
-            for pic in all_pics:
-                pid = pic.get("pid", "")
-                thumb = pic.get("url", "")
-                thumb_urls.append(thumb)
-                if pid:
-                    tasks.append(get_best_url(pid))
-                else:
-                    fallback = pic.get("large", {}).get("url") or pic.get("url", "")
-                    async def _fallback(u=fallback):
-                        return (u, 0)
-                    tasks.append(_fallback())
+            # 1 client dùng chung cho toàn bộ N ảnh khi dò size — tránh bắt
+            # tay TLS lại từ đầu cho mỗi ảnh (trước đây get_best_url tự mở
+            # client riêng mỗi ảnh).
+            async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as img_client:
+                tasks = []
+                for pic in all_pics:
+                    pid = pic.get("pid", "")
+                    thumb = pic.get("url", "")
+                    thumb_urls.append(thumb)
+                    if pid:
+                        tasks.append(get_best_url(pid, client=img_client))
+                    else:
+                        fallback = pic.get("large", {}).get("url") or pic.get("url", "")
+                        async def _fallback(u=fallback):
+                            return (u, 0)
+                        tasks.append(_fallback())
 
-            results = await _gather_in_chunks(tasks)
+                results = await _gather_in_chunks(tasks)
             raw_urls = [u for u, s in results]
             raw_sizes = [s for u, s in results]
 
@@ -279,19 +310,27 @@ async def fetch_content_for_pics(
     không download lại lần 2. `selected_pics` là list (index_gốc, pic_dict).
     Trả về orig_indices song song với url/size/content để giữ đúng số thứ tự
     hiển thị (#N) dù chỉ tải một phần album."""
-    tasks = []
-    for _, pic in selected_pics:
-        pid = pic.get("pid", "")
-        if pid:
-            tasks.append(get_best_url_with_content(pid))
-        else:
-            fallback = pic.get("large", {}).get("url") or pic.get("url", "")
-            async def _fallback(u=fallback):
-                b = await download_image(u)
-                return (u, len(b) if b else 0, b)
-            tasks.append(_fallback())
+    # 1 client dùng chung cho toàn bộ N ảnh (pool connection tối đa =
+    # CHUNK_SIZE) thay vì mỗi ảnh tự bắt tay TLS riêng cho cả bước dò size lẫn
+    # bước GET nội dung thật.
+    async with httpx.AsyncClient(
+        headers=HEADERS_IMG,
+        follow_redirects=True,
+        limits=httpx.Limits(max_connections=CHUNK_SIZE, max_keepalive_connections=CHUNK_SIZE),
+    ) as client:
+        tasks = []
+        for _, pic in selected_pics:
+            pid = pic.get("pid", "")
+            if pid:
+                tasks.append(get_best_url_with_content(pid, client=client))
+            else:
+                fallback = pic.get("large", {}).get("url") or pic.get("url", "")
+                async def _fallback(u=fallback, c=client):
+                    b = await download_image(u, client=c)
+                    return (u, len(b) if b else 0, b)
+                tasks.append(_fallback())
 
-    results = await _gather_in_chunks(tasks)
+        results = await _gather_in_chunks(tasks)
     orig_indices = [i for i, _ in selected_pics]
     raw_urls     = [u for u, s, b in results]
     raw_sizes    = [s for u, s, b in results]
@@ -381,7 +420,12 @@ async def show_preview(bot: Bot, chat_id: int, reply_to_message_id: int, url: st
 
     await bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=f"📥 Đang tải preview {len(raw_urls)} ảnh...")
 
-    thumb_bytes = await asyncio.gather(*[download_image(u) for u in thumb_urls])
+    # 1 client dùng chung cho toàn bộ N thumbnail thay vì mỗi ảnh tự bắt tay
+    # TLS riêng.
+    async with httpx.AsyncClient(headers=HEADERS_IMG, follow_redirects=True) as thumb_client:
+        thumb_bytes = await asyncio.gather(
+            *[download_image(u, client=thumb_client) for u in thumb_urls]
+        )
 
     await bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=f"🖼 {len(raw_urls)} ảnh — bấm nút bên dưới mỗi ảnh để tải:")
 
