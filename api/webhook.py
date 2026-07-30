@@ -647,10 +647,39 @@ async def process_update(update_data: dict):
                 await bot.send_message(chat_id=chat_id, text=f"❌ Không tải được ảnh #{idx+1}")
 
 # ─── VERCEL HANDLER ───────────────────────────────────────────────────────────
+# /api/webhook (Telegram gọi) chỉ ACK NGAY rồi bắn update sang /api/process —
+# một invocation Vercel riêng, có trọn HEAVY_TASK_TIMEOUT_SEC để xử lý nặng.
+# Lý do: nếu xử lý nặng ngay trong /api/webhook, khi vượt quá thời gian
+# Telegram chịu chờ webhook phản hồi, Telegram sẽ tự động gửi lại NGUYÊN update
+# đó → chạy lại process_update() lần 2 → ảnh/tin nhắn bị gửi trùng lặp (xem
+# ghi chú ở IMAGE_SIZES). Tách endpoint giúp /api/webhook luôn phản hồi trong
+# vài trăm ms bất kể tác vụ nặng mất bao lâu.
+INTERNAL_DISPATCH_SECRET = hashlib.sha256(f"dispatch:{BOT_TOKEN}".encode()).hexdigest()
+
+async def dispatch_to_worker(update_data: dict):
+    base_url = os.environ.get("VERCEL_URL")
+    if not base_url:
+        # Không có base URL public (vd chạy local) → xử lý luôn tại chỗ.
+        await process_update(update_data)
+        return
+    if not base_url.startswith("http"):
+        base_url = f"https://{base_url}"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            await client.post(
+                f"{base_url}/api/process",
+                json=update_data,
+                headers={"X-Internal-Secret": INTERNAL_DISPATCH_SECRET},
+            )
+    except (httpx.ReadTimeout, httpx.ConnectTimeout):
+        # Request đã được Vercel nhận và bắt đầu invocation /api/process rồi
+        # — không cần chờ nó xử lý/upload ảnh xong mới trả lời Telegram.
+        pass
+
 
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        if self.path != "/api/webhook":
+        if self.path not in ("/api/webhook", "/api/process"):
             self.send_response(404)
             self.end_headers()
             return
@@ -660,7 +689,14 @@ class handler(BaseHTTPRequestHandler):
 
         try:
             update_data = json.loads(body)
-            asyncio.run(process_update(update_data))
+            if self.path == "/api/webhook":
+                asyncio.run(dispatch_to_worker(update_data))
+            else:
+                if self.headers.get("X-Internal-Secret") != INTERNAL_DISPATCH_SECRET:
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                asyncio.run(process_update(update_data))
         except Exception as e:
             print(f"[Handler Error] {e}")
             import traceback
